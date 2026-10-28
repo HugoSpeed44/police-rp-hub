@@ -46,11 +46,19 @@ async function initDatabase() {
       nom VARCHAR(128) NOT NULL,
       grade VARCHAR(128) NOT NULL DEFAULT 'Gardien-brigadier',
       specialties TEXT NULL,
-      password VARCHAR(128) DEFAULT 'pm1234',
+      password VARCHAR(255) DEFAULT 'pm1234',
+      website_access TINYINT(1) NOT NULL DEFAULT 0,
       is_admin TINYINT(1) DEFAULT 0,
       created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
   `);
+
+  try {
+    await p.query('ALTER TABLE pm_officers ADD COLUMN website_access TINYINT(1) NOT NULL DEFAULT 0');
+  } catch (err) {
+    if (err.code !== 'ER_DUP_FIELDNAME') throw err;
+  }
+  await p.query("ALTER TABLE pm_officers MODIFY password VARCHAR(255) DEFAULT 'pm1234'");
 
   // 3. Services (Pointeuse)
   await p.query(`

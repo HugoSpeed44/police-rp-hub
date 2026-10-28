@@ -6,6 +6,8 @@ const db = require('./db');
 const PORT = Number(process.env.PORT || 10000);
 const sessions = new Map();
 const SESSION_TTL_MS = 12 * 60 * 60 * 1000;
+const allowedOriginSetting = String(process.env.ALLOWED_ORIGIN || '').trim();
+const allowedOrigin = allowedOriginSetting ? new URL(allowedOriginSetting).origin : '';
 
 function send(res, status, payload) {
   res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
@@ -47,6 +49,7 @@ function normalizeOfficer(officer) {
   }
   return {
     u: officer.username,
+    discord_id: officer.discord_id || null,
     nom: officer.nom,
     mat: officer.rio,
     rio: officer.rio,
@@ -58,9 +61,25 @@ function normalizeOfficer(officer) {
   };
 }
 
+async function verifyPortalPassword(password, stored) {
+  if (typeof stored !== 'string') return false;
+  const parts = stored.split('$');
+  if (parts.length !== 3 || parts[0] !== 'scrypt') return stored === password;
+  try {
+    const salt = Buffer.from(parts[1], 'hex');
+    const expected = Buffer.from(parts[2], 'hex');
+    if (salt.length !== 16 || expected.length !== 64) return false;
+    const actual = await new Promise((resolve, reject) => {
+      crypto.scrypt(password, salt, expected.length, (err, result) => err ? reject(err) : resolve(result));
+    });
+    return crypto.timingSafeEqual(expected, actual);
+  } catch (_) {
+    return false;
+  }
+}
+
 const server = http.createServer(async (req, res) => {
   const origin = req.headers.origin;
-  const allowedOrigin = process.env.ALLOWED_ORIGIN;
   if (allowedOrigin && origin && origin !== allowedOrigin) {
     return send(res, 403, { ok: false, error: 'Origine non autorisée' });
   }
@@ -81,7 +100,7 @@ const server = http.createServer(async (req, res) => {
       const password = String(body.p || '');
       if (!username || !password) return send(res, 400, { ok: false, error: 'Identifiant et mot de passe requis' });
       const officer = await db.getOfficerByUsername(username);
-      if (!officer || !officer.password || officer.password !== password) {
+      if (!officer || !officer.website_access || !await verifyPortalPassword(password, officer.password)) {
         return send(res, 401, { ok: false, error: 'Identifiant ou mot de passe incorrect' });
       }
       const user = normalizeOfficer(officer);
@@ -112,7 +131,7 @@ const server = http.createServer(async (req, res) => {
 
     if (path === '/api/service/start' && req.method === 'POST') {
       const body = await readJson(req);
-      const service = await db.startService({ rio: user.rio, nom: user.nom, grade: user.grade, is_csu: body.is_csu ? 1 : 0 });
+      const service = await db.startService({ rio: user.rio, discord_id: user.discord_id, nom: user.nom, grade: user.grade, is_csu: body.is_csu ? 1 : 0 });
       return send(res, 200, { ok: true, service: await db.getActiveServiceByRio(user.rio) || service });
     }
     if (path === '/api/service/pause' && req.method === 'POST') {
@@ -129,8 +148,8 @@ const server = http.createServer(async (req, res) => {
         await db.clearCsuOperator();
       } else {
         const active = await db.getActiveServiceByRio(user.rio);
-        if (!active) await db.startService({ rio: user.rio, nom: user.nom, grade: user.grade, is_csu: 1 });
-        else await db.setCsuOperator({ rio: user.rio, nom: user.nom });
+        if (!active) await db.startService({ rio: user.rio, discord_id: user.discord_id, nom: user.nom, grade: user.grade, is_csu: 1 });
+        else await db.setCsuOperator({ rio: user.rio, discord_id: user.discord_id, nom: user.nom });
       }
       return send(res, 200, { ok: true, csuState: await db.getCsuState() });
     }
@@ -162,6 +181,32 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (path === '/api/casiers' && req.method === 'GET') return send(res, 200, await db.getAllCasiers());
+    if (path === '/api/bot/status' && req.method === 'GET') {
+      const pool = await db.getPool();
+      const [rows] = await pool.query('SELECT * FROM pm_bot_heartbeat WHERE id = 1');
+      const heartbeat = rows[0] || {};
+      const lastHeartbeat = Number(heartbeat.last_heartbeat || 0);
+      const online = lastHeartbeat > 0 && (Date.now() - lastHeartbeat) < 300000;
+      let guilds = [];
+      try { guilds = JSON.parse(heartbeat.guilds_info || '[]'); } catch { guilds = []; }
+      const [activeServices, csu] = await Promise.all([db.getAllActiveServices(), db.getCsuState()]);
+      return send(res, 200, {
+        ok: true,
+        botStatus: {
+          online,
+          ping: online ? Number(heartbeat.ping_ms || 0) : 0,
+          user: online ? { id: heartbeat.bot_id || '', tag: heartbeat.bot_name || 'Bot Police Municipale' } : null,
+          guilds: online ? guilds : []
+        },
+        monitoring: {
+          frequency: 'Canal 20 (20.0 MHz)',
+          activeServicesCount: activeServices.length,
+          csuOperator: csu?.operator_name || 'Aucun (Standard vacant)',
+          databaseSync: true,
+          hostArchitecture: 'Bot Discord autonome — état reçu par heartbeat MySQL'
+        }
+      });
+    }
     if (path.startsWith('/api/bot/')) return send(res, 503, { ok: false, error: 'Le bot Discord reste hébergé séparément.' });
     return send(res, 404, { ok: false, error: 'Route API inconnue' });
   } catch (err) {
