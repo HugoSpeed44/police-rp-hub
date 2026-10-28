@@ -498,9 +498,8 @@ async function stopService(rio, { report = '', discord_id = null } = {}) {
   const startTimeStr = startDate.toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit' });
   const endTimeStr = endDate.toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit' });
   const typeStr = active.is_csu ? 'Supervision Vidéoprotection (CSU)' : (active.patrol_name || 'Patrouille Opérationnelle');
-  const pauseMin = Math.floor(totalPause / 60000);
   const activity = String(report || '').trim().slice(0, 1500);
-  const reportStr = `${activity || 'Aucune activité précisée.'}\n\nVacation officielle achevée (${hoursWorked}h validées). Pause déduite : ${pauseMin} min.`;
+  const reportStr = activity || 'Aucune activité précisée.';
 
   try {
     await p.query(
