@@ -62,6 +62,22 @@ function normalizeOfficer(officer) {
   };
 }
 
+function canManageHr(user) {
+  const grade = String(user?.grade || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').trim().toLowerCase();
+  return ['directeur principal', 'directeur adjoint', 'directeur de police municipale'].includes(grade);
+}
+
+function canDeleteSiteAccounts(user) {
+  return Boolean(user?.admin && String(user.u || '').trim().toLowerCase() === 'admin');
+}
+
+function parseJsonArray(value) {
+  if (Array.isArray(value)) return value;
+  if (typeof value !== 'string' || !value) return [];
+  try { const parsed = JSON.parse(value); return Array.isArray(parsed) ? parsed : []; }
+  catch { return []; }
+}
+
 async function verifyPortalPassword(password, stored) {
   if (typeof stored !== 'string') return false;
   const parts = stored.split('$');
@@ -147,6 +163,16 @@ const server = http.createServer(async (req, res) => {
 
     if (!user.profileCompleted) return send(res, 403, { ok: false, error: 'Complète ton profil avant d’utiliser le portail.', code: 'PROFILE_REQUIRED' });
 
+    if (path === '/api/officers/accounts' && req.method === 'GET') {
+      if (!user.admin) return send(res, 403, { ok: false, error: 'Réservé à l’administrateur du site.' });
+      return send(res, 200, { ok: true, accounts: await db.getPortalAccounts() });
+    }
+
+    if (path === '/api/management/history' && req.method === 'GET') {
+      if (!canManageHr(user)) return send(res, 403, { ok: false, error: 'La gestion RH est réservée aux deux grades de direction.' });
+      return send(res, 200, { ok: true, history: await db.getManagementHistory(30) });
+    }
+
     if (path === '/api/officers' && req.method === 'GET') {
       const officers = await db.getPublicOfficers();
       return send(res, 200, { ok: true, officers: officers.map(officer => {
@@ -154,9 +180,65 @@ const server = http.createServer(async (req, res) => {
         return {
           badge: String(officer.rio), firstName: nameParts.shift() || '', lastName: nameParts.join(' '),
           grade: officer.grade || 'Agent PM', specialties: officer.specialties || [],
+          salary: Number(officer.salary || 0), notes: officer.notes || '', awards: officer.awards || [], warnings: officer.warnings || [],
           weekHours: Number(officer.week_hours || 0), totalHours: Number(officer.total_hours || 0)
         };
       }) });
+    }
+
+    const officerRoute = /^\/api\/officers\/([^/]+)$/.exec(path);
+    if (officerRoute && req.method === 'PUT') {
+      if (!canManageHr(user)) return send(res, 403, { ok: false, error: 'La gestion RH est réservée aux deux grades de direction.' });
+      const rio = decodeURIComponent(officerRoute[1]);
+      const body = await readJson(req);
+      const existing = await db.getOfficerByRio(rio);
+      if (!existing || !existing.profile_completed) return send(res, 404, { ok: false, error: 'Agent introuvable.' });
+      const grade = String(body.grade || '').trim();
+      const salary = Number(body.salary);
+      const specialties = Array.isArray(body.specialties) ? body.specialties.map(x => String(x).trim()).filter(Boolean) : [];
+      const awards = Array.isArray(body.awards) ? body.awards.map(x => String(x).trim()).filter(Boolean) : [];
+      const warnings = Array.isArray(body.warnings) ? body.warnings.map(x => String(x).trim()).filter(Boolean) : [];
+      const notes = String(body.notes || '').trim();
+      if (!grade || grade.length > 128 || !Number.isFinite(salary) || salary < 0 || salary > 100000) {
+        return send(res, 400, { ok: false, error: 'Grade ou traitement mensuel invalide.' });
+      }
+      if (specialties.length > 40 || specialties.some(x => x.length > 100) || awards.length > 50 || warnings.length > 50 || [...awards, ...warnings].some(x => x.length > 250) || notes.length > 5000) {
+        return send(res, 400, { ok: false, error: 'Le dossier contient trop de valeurs ou un texte trop long.' });
+      }
+      const beforeSpecialties = (() => { try { return JSON.parse(existing.specialties || '[]'); } catch { return []; } })();
+      const changes = [];
+      if (existing.grade !== grade) changes.push(`Grade : ${existing.grade} → ${grade}`);
+      if (Number(existing.salary || 0) !== salary) changes.push(`Traitement réévalué à ${salary} €`);
+      if (JSON.stringify([...beforeSpecialties].sort()) !== JSON.stringify([...specialties].sort())) changes.push(`Affectations modifiées (${specialties.length} spécialités)`);
+      if (String(existing.notes || '') !== notes) changes.push('Observations modifiées');
+      const oldAwards = (() => { try { return JSON.parse(existing.awards || '[]'); } catch { return []; } })();
+      const oldWarnings = (() => { try { return JSON.parse(existing.warnings || '[]'); } catch { return []; } })();
+      if (JSON.stringify(oldAwards) !== JSON.stringify(awards)) changes.push('Décorations modifiées');
+      if (JSON.stringify(oldWarnings) !== JSON.stringify(warnings)) changes.push('Avertissements modifiés');
+      const action = changes[0] || 'Dossier RH actualisé';
+      const author = `${user.grade} ${user.nom} (RIO #${user.rio})`;
+      const officer = await db.updateOfficerHr(rio, { grade, salary, specialties, notes, awards, warnings, action, details: changes.join(' • ') || 'Aucun changement de valeur.' }, author);
+      if (!officer) return send(res, 404, { ok: false, error: 'Agent introuvable.' });
+      const nameParts = String(officer.nom || '').trim().split(/\s+/);
+      return send(res, 200, { ok: true, officer: {
+        badge: String(officer.rio), firstName: nameParts.shift() || '', lastName: nameParts.join(' '),
+        grade: officer.grade, specialties, salary: Number(officer.salary || 0), notes: officer.notes || '',
+        awards: parseJsonArray(officer.awards), warnings: parseJsonArray(officer.warnings)
+      }, history: await db.getManagementHistory(30) });
+    }
+
+    if (officerRoute && req.method === 'DELETE') {
+      if (!canDeleteSiteAccounts(user)) return send(res, 403, { ok: false, error: 'Seul le compte administrateur principal peut supprimer des comptes.' });
+      const rio = decodeURIComponent(officerRoute[1]);
+      const target = await db.getOfficerByRio(rio);
+      if (target?.username === user.u) return send(res, 400, { ok: false, error: 'Tu ne peux pas supprimer le compte actuellement connecté.' });
+      const result = await db.deleteOfficerAccount(rio);
+      if (!result.ok && result.reason === 'protected') return send(res, 403, { ok: false, error: 'Le compte administrateur principal est protégé.' });
+      if (!result.ok) return send(res, 404, { ok: false, error: 'Compte introuvable.' });
+      for (const [token, session] of sessions.entries()) {
+        if (session.user.u === result.officer.username) sessions.delete(token);
+      }
+      return send(res, 200, { ok: true });
     }
 
     if (path === '/api/auth/discord-link' && req.method === 'POST') {

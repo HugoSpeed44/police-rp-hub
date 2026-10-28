@@ -46,6 +46,10 @@ async function initDatabase() {
       nom VARCHAR(128) NOT NULL,
       grade VARCHAR(128) NOT NULL DEFAULT 'Gardien-brigadier',
       specialties TEXT NULL,
+      salary DECIMAL(10,2) NOT NULL DEFAULT 0,
+      notes TEXT NULL,
+      awards TEXT NULL,
+      warnings TEXT NULL,
       password VARCHAR(255) DEFAULT 'pm1234',
       website_access TINYINT(1) NOT NULL DEFAULT 0,
       profile_completed TINYINT(1) NOT NULL DEFAULT 1,
@@ -66,6 +70,38 @@ async function initDatabase() {
     if (err.code !== 'ER_DUP_FIELDNAME') throw err;
   }
   await p.query("ALTER TABLE pm_officers MODIFY password VARCHAR(255) DEFAULT 'pm1234'");
+  for (const statement of [
+    'ALTER TABLE pm_officers ADD COLUMN salary DECIMAL(10,2) NOT NULL DEFAULT 0',
+    'ALTER TABLE pm_officers ADD COLUMN notes TEXT NULL',
+    'ALTER TABLE pm_officers ADD COLUMN awards TEXT NULL',
+    'ALTER TABLE pm_officers ADD COLUMN warnings TEXT NULL'
+  ]) {
+    try { await p.query(statement); }
+    catch (err) { if (err.code !== 'ER_DUP_FIELDNAME') throw err; }
+  }
+
+  await p.query(`
+    CREATE TABLE IF NOT EXISTS pm_management_history (
+      id INT AUTO_INCREMENT PRIMARY KEY,
+      officer_rio VARCHAR(32) NOT NULL,
+      officer_name VARCHAR(128) NOT NULL,
+      action VARCHAR(255) NOT NULL,
+      details TEXT NOT NULL,
+      author VARCHAR(160) NOT NULL,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      INDEX idx_management_history_created (created_at)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+  `);
+
+  await p.query(`
+    CREATE TABLE IF NOT EXISTS pm_site_account_issuance (
+      discord_id VARCHAR(32) PRIMARY KEY,
+      username VARCHAR(64) NOT NULL,
+      status VARCHAR(16) NOT NULL DEFAULT 'pending',
+      requested_at BIGINT NOT NULL,
+      issued_at BIGINT NULL
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+  `);
 
   // 3. Services (Pointeuse)
   await p.query(`
@@ -333,12 +369,63 @@ async function getAllOfficers() {
 async function getPublicOfficers() {
   const p = await getPool();
   const [rows] = await p.query(
-    'SELECT id, discord_id, username, rio, nom, grade, specialties, is_admin, created_at, week_hours, total_hours FROM pm_officers WHERE profile_completed = 1 ORDER BY nom ASC'
+    'SELECT id, discord_id, username, rio, nom, grade, specialties, salary, notes, awards, warnings, is_admin, created_at, week_hours, total_hours FROM pm_officers WHERE profile_completed = 1 ORDER BY nom ASC'
   );
   return rows.map(r => ({
     ...r,
-    specialties: typeof r.specialties === 'string' ? JSON.parse(r.specialties || '[]') : (r.specialties || [])
+    specialties: parseJsonArray(r.specialties),
+    awards: parseJsonArray(r.awards),
+    warnings: parseJsonArray(r.warnings)
   }));
+}
+
+function parseJsonArray(value) {
+  if (Array.isArray(value)) return value;
+  if (typeof value !== 'string' || !value) return [];
+  try { const parsed = JSON.parse(value); return Array.isArray(parsed) ? parsed : []; }
+  catch { return []; }
+}
+
+async function getPortalAccounts() {
+  const p = await getPool();
+  const [rows] = await p.query('SELECT discord_id, username, rio, nom, grade, is_admin, website_access, profile_completed, created_at FROM pm_officers ORDER BY nom ASC');
+  return rows;
+}
+
+async function updateOfficerHr(rio, changes, author) {
+  const p = await getPool();
+  const existing = await getOfficerByRio(rio);
+  if (!existing) return null;
+  await p.query(
+    'UPDATE pm_officers SET grade = ?, salary = ?, specialties = ?, notes = ?, awards = ?, warnings = ? WHERE rio = ?',
+    [changes.grade, changes.salary, JSON.stringify(changes.specialties), changes.notes, JSON.stringify(changes.awards), JSON.stringify(changes.warnings), rio]
+  );
+  const officer = await getOfficerByRio(rio);
+  const name = String(officer.nom || 'Agent');
+  const details = changes.details || 'Dossier RH actualisé.';
+  await p.query(
+    'INSERT INTO pm_management_history (officer_rio, officer_name, action, details, author) VALUES (?, ?, ?, ?, ?)',
+    [rio, name, changes.action || 'Dossier RH mis à jour', details, author]
+  );
+  return officer;
+}
+
+async function getManagementHistory(limit = 30) {
+  const p = await getPool();
+  const safeLimit = Math.max(1, Math.min(100, Number(limit) || 30));
+  const [rows] = await p.query('SELECT id, officer_rio AS officerBadge, officer_name AS officerName, action, details, author, created_at AS date FROM pm_management_history ORDER BY id DESC LIMIT ?', [safeLimit]);
+  return rows.map(row => ({ ...row, date: row.date instanceof Date ? row.date.toISOString().slice(0, 16).replace('T', ' ') : row.date }));
+}
+
+async function deleteOfficerAccount(rio) {
+  const p = await getPool();
+  const [rows] = await p.query('SELECT discord_id, is_admin, username FROM pm_officers WHERE rio = ? LIMIT 1', [rio]);
+  const officer = rows[0];
+  if (!officer) return { ok: false, reason: 'not_found' };
+  if (officer.is_admin || String(officer.username).toLowerCase() === 'admin') return { ok: false, reason: 'protected' };
+  if (officer.discord_id) await p.query('DELETE FROM pm_site_account_issuance WHERE discord_id = ?', [officer.discord_id]);
+  await p.query('DELETE FROM pm_officers WHERE rio = ?', [rio]);
+  return { ok: true, officer };
 }
 
 async function completeOfficerProfile({ username, rio, discordId, firstName, lastName }) {
@@ -931,6 +1018,10 @@ module.exports = {
   getOfficerByRio,
   getAllOfficers,
   getPublicOfficers,
+  getPortalAccounts,
+  updateOfficerHr,
+  getManagementHistory,
+  deleteOfficerAccount,
   completeOfficerProfile,
   saveOfficer,
   deleteOfficer,
