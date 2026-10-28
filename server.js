@@ -112,7 +112,16 @@ const server = http.createServer(async (req, res) => {
 
     const user = getSession(req);
     if (path === '/api/auth/me' && req.method === 'GET') {
-      return send(res, 200, { loggedIn: Boolean(user), user: user || null });
+      if (!user) return send(res, 200, { loggedIn: false, user: null });
+      const token = /^Bearer\s+(.+)$/i.exec(req.headers.authorization || '')?.[1];
+      const officer = await db.getOfficerByUsername(user.u);
+      if (!officer || !officer.website_access) {
+        if (token) sessions.delete(token);
+        return send(res, 200, { loggedIn: false, user: null });
+      }
+      const updatedUser = normalizeOfficer(officer);
+      if (token && sessions.has(token)) sessions.get(token).user = updatedUser;
+      return send(res, 200, { loggedIn: true, user: updatedUser });
     }
     if (path === '/api/auth/logout' && req.method === 'POST') {
       const match = /^Bearer\s+(.+)$/i.exec(req.headers.authorization || '');
