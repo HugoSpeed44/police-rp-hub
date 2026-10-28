@@ -57,6 +57,7 @@ function normalizeOfficer(officer) {
     admin: Boolean(officer.is_admin),
     specialties: Array.isArray(specialties) ? specialties : [],
     hasCsuAccess: Boolean(officer.is_admin || specialties.some(x => String(x).toLowerCase().includes('csu'))),
+    profileCompleted: Boolean(officer.profile_completed),
     force: 'PM'
   };
 }
@@ -119,6 +120,35 @@ const server = http.createServer(async (req, res) => {
       return send(res, 200, { ok: true });
     }
     if (!user) return send(res, 401, { ok: false, error: 'Session expirée, reconnectez-vous.' });
+
+    if (path === '/api/auth/profile' && req.method === 'POST') {
+      const body = await readJson(req);
+      const firstName = String(body.firstName || '').trim().replace(/\s+/g, ' ');
+      const lastName = String(body.lastName || '').trim().replace(/\s+/g, ' ');
+      if (firstName.length < 2 || firstName.length > 64 || lastName.length < 2 || lastName.length > 64) {
+        return send(res, 400, { ok: false, error: 'Saisis un prénom et un nom RP valides (2 à 64 caractères chacun).' });
+      }
+      const result = await db.completeOfficerProfile({ username: user.u, rio: user.rio, discordId: user.discord_id, firstName, lastName });
+      if (!result.ok) return send(res, 404, { ok: false, error: 'Compte agent introuvable. Contacte un responsable.' });
+      const updatedUser = normalizeOfficer(result.officer);
+      const token = /^Bearer\s+(.+)$/i.exec(req.headers.authorization || '')?.[1];
+      if (token && sessions.has(token)) sessions.get(token).user = updatedUser;
+      return send(res, 200, { ok: true, user: updatedUser });
+    }
+
+    if (!user.profileCompleted) return send(res, 403, { ok: false, error: 'Complète ton profil avant d’utiliser le portail.', code: 'PROFILE_REQUIRED' });
+
+    if (path === '/api/officers' && req.method === 'GET') {
+      const officers = await db.getPublicOfficers();
+      return send(res, 200, { ok: true, officers: officers.map(officer => {
+        const nameParts = String(officer.nom || '').trim().split(/\s+/);
+        return {
+          badge: String(officer.rio), firstName: nameParts.shift() || '', lastName: nameParts.join(' '),
+          grade: officer.grade || 'Agent PM', specialties: officer.specialties || [],
+          weekHours: Number(officer.week_hours || 0), totalHours: Number(officer.total_hours || 0)
+        };
+      }) });
+    }
 
     if (path === '/api/auth/discord-link' && req.method === 'POST') {
       const body = await readJson(req);

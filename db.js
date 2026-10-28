@@ -48,6 +48,7 @@ async function initDatabase() {
       specialties TEXT NULL,
       password VARCHAR(255) DEFAULT 'pm1234',
       website_access TINYINT(1) NOT NULL DEFAULT 0,
+      profile_completed TINYINT(1) NOT NULL DEFAULT 1,
       is_admin TINYINT(1) DEFAULT 0,
       created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
@@ -55,6 +56,12 @@ async function initDatabase() {
 
   try {
     await p.query('ALTER TABLE pm_officers ADD COLUMN website_access TINYINT(1) NOT NULL DEFAULT 0');
+  } catch (err) {
+    if (err.code !== 'ER_DUP_FIELDNAME') throw err;
+  }
+  try {
+    await p.query('ALTER TABLE pm_officers ADD COLUMN profile_completed TINYINT(1) NOT NULL DEFAULT 1');
+    await p.query('UPDATE pm_officers SET profile_completed = 0 WHERE is_admin = 0');
   } catch (err) {
     if (err.code !== 'ER_DUP_FIELDNAME') throw err;
   }
@@ -321,6 +328,28 @@ async function getAllOfficers() {
     ...r,
     specialties: typeof r.specialties === 'string' ? JSON.parse(r.specialties || '[]') : (r.specialties || [])
   }));
+}
+
+async function getPublicOfficers() {
+  const p = await getPool();
+  const [rows] = await p.query(
+    'SELECT id, discord_id, username, rio, nom, grade, specialties, is_admin, created_at, week_hours, total_hours FROM pm_officers WHERE profile_completed = 1 ORDER BY nom ASC'
+  );
+  return rows.map(r => ({
+    ...r,
+    specialties: typeof r.specialties === 'string' ? JSON.parse(r.specialties || '[]') : (r.specialties || [])
+  }));
+}
+
+async function completeOfficerProfile({ username, rio, discordId, firstName, lastName }) {
+  const p = await getPool();
+  const fullName = `${firstName} ${lastName}`.trim();
+  const [result] = await p.query(
+    'UPDATE pm_officers SET nom = ?, profile_completed = 1 WHERE LOWER(username) = LOWER(?) AND rio = ? AND (discord_id = ? OR (discord_id IS NULL AND ? IS NULL))',
+    [fullName, username, rio, discordId, discordId]
+  );
+  if (!result.affectedRows) return { ok: false, reason: 'account_not_found' };
+  return { ok: true, officer: await getOfficerByRio(rio) };
 }
 
 async function saveOfficer(data) {
@@ -901,6 +930,8 @@ module.exports = {
   setOfficerDiscordId,
   getOfficerByRio,
   getAllOfficers,
+  getPublicOfficers,
+  completeOfficerProfile,
   saveOfficer,
   deleteOfficer,
   getActiveServiceByRio,
