@@ -14,12 +14,12 @@ function send(res, status, payload) {
   res.end(JSON.stringify(payload));
 }
 
-function readJson(req) {
+function readJson(req, maxBytes = 1024 * 1024) {
   return new Promise((resolve, reject) => {
     let raw = '';
     req.on('data', chunk => {
       raw += chunk;
-      if (raw.length > 1024 * 1024) reject(Object.assign(new Error('Requête trop volumineuse'), { status: 413 }));
+      if (raw.length > maxBytes) reject(Object.assign(new Error('Requête trop volumineuse'), { status: 413 }));
     });
     req.on('end', () => {
       if (!raw) return resolve({});
@@ -198,6 +198,31 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (path === '/api/casiers' && req.method === 'GET') return send(res, 200, await db.getAllCasiers());
+    if (path === '/api/casiers' && req.method === 'POST') {
+      const body = await readJson(req);
+      const result = await db.saveCasier(body.record, user);
+      return send(res, 200, { ok: true, ...result });
+    }
+    if (path === '/api/casiers/import-legacy' && req.method === 'POST') {
+      if (!user.admin) return send(res, 403, { ok: false, error: 'Import historique réservé à l’administrateur.' });
+      const body = await readJson(req, 8 * 1024 * 1024);
+      if (!Array.isArray(body.records) || body.records.length > 2000) return send(res, 400, { ok: false, error: 'Archive de casiers invalide.' });
+      const imported = await db.importLegacyCasiers(body.records);
+      return send(res, 200, { ok: true, imported, casiers: await db.getAllCasiers() });
+    }
+    const casierReviewMatch = /^\/api\/casiers\/([A-Za-z0-9_-]{1,64})\/review$/.exec(path);
+    if (casierReviewMatch && req.method === 'POST') {
+      const body = await readJson(req);
+      const casier = await db.reviewCasier(casierReviewMatch[1], { approved: Boolean(body.approved), note: body.note }, user);
+      if (!casier) return send(res, 404, { ok: false, error: 'Casier introuvable.' });
+      return send(res, 200, { ok: true, casier, casiers: await db.getAllCasiers() });
+    }
+    const casierMatch = /^\/api\/casiers\/([A-Za-z0-9_-]{1,64})$/.exec(path);
+    if (casierMatch && req.method === 'DELETE') {
+      const deleted = await db.deleteCasier(casierMatch[1], user);
+      if (!deleted) return send(res, 404, { ok: false, error: 'Casier introuvable.' });
+      return send(res, 200, { ok: true, casiers: await db.getAllCasiers() });
+    }
     if (path === '/api/bot/status' && req.method === 'GET') {
       const pool = await db.getPool();
       const [rows] = await pool.query('SELECT * FROM pm_bot_heartbeat WHERE id = 1');

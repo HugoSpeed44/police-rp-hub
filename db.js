@@ -209,9 +209,23 @@ async function initDatabase() {
       data_json LONGTEXT,
       saved_by VARCHAR(64) DEFAULT 'admin',
       saved_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      created_by_rio VARCHAR(32) NULL,
+      created_by_username VARCHAR(64) NULL,
+      status VARCHAR(16) NOT NULL DEFAULT 'APPROVED',
+      reviewed_by VARCHAR(64) NULL,
+      reviewed_at BIGINT NULL,
+      review_note VARCHAR(500) NULL,
       INDEX idx_casier_no (no)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
   `);
+  for (const migration of [
+    'ALTER TABLE pm_casiers ADD COLUMN created_by_rio VARCHAR(32) NULL',
+    'ALTER TABLE pm_casiers ADD COLUMN created_by_username VARCHAR(64) NULL',
+    "ALTER TABLE pm_casiers ADD COLUMN status VARCHAR(16) NOT NULL DEFAULT 'APPROVED'",
+    'ALTER TABLE pm_casiers ADD COLUMN reviewed_by VARCHAR(64) NULL',
+    'ALTER TABLE pm_casiers ADD COLUMN reviewed_at BIGINT NULL',
+    'ALTER TABLE pm_casiers ADD COLUMN review_note VARCHAR(500) NULL'
+  ]) { try { await p.query(migration); } catch (err) { if (err.code !== 'ER_DUP_FIELDNAME') throw err; } }
 
   // 9. Absences
   await p.query(`
@@ -679,6 +693,12 @@ function parseCasierRow(row) {
     no: data.no || row.no,
     saved_by: row.saved_by || data.by || data.agentNom,
     saved_at: row.saved_at,
+    createdByRio: row.created_by_rio || data.createdByRio || '',
+    createdByUsername: row.created_by_username || data.createdByUsername || data.by || '',
+    status: row.status || data.status || 'APPROVED',
+    reviewedBy: row.reviewed_by || data.reviewedBy || '',
+    reviewedAt: row.reviewed_at || data.reviewedAt || null,
+    reviewNote: row.review_note || data.reviewNote || '',
     location: data.lieu || row.location || '',
     suspect_name: row.suspect_name || [data.prenom, data.nom].filter(Boolean).join(' ')
   };
@@ -706,6 +726,116 @@ async function getAllCasiers() {
   const p = await getPool();
   const [rows] = await p.query('SELECT * FROM pm_casiers ORDER BY no ASC, saved_at ASC');
   return rows.map(parseCasierRow);
+}
+
+function canReviewCasiers(user) {
+  const grade = String(user?.grade || '').toLocaleLowerCase('fr');
+  return Boolean(user?.admin || grade.includes('directeur principal') || grade.includes('directeur adjoint'));
+}
+
+function canEditCasier(row, data, user) {
+  if (canReviewCasiers(user)) return true;
+  return String(row.created_by_username || row.saved_by || data.by || '') === String(user.u || '')
+    || Boolean(user.rio && String(row.created_by_rio || data.createdByRio || '') === String(user.rio));
+}
+
+async function saveCasier(record, user) {
+  const p = await getPool();
+  const id = String(record?.id || '').trim();
+  if (!/^[A-Za-z0-9_-]{1,64}$/.test(id) || !record || !Array.isArray(record.lines)) {
+    throw Object.assign(new Error('Casier invalide.'), { status: 400 });
+  }
+  const [existingRows] = await p.query('SELECT * FROM pm_casiers WHERE id = ? LIMIT 1', [id]);
+  const existing = existingRows[0] || null;
+  let oldData = {};
+  if (existing) {
+    try { oldData = JSON.parse(existing.data_json || '{}') || {}; } catch (_) {}
+    if (!canEditCasier(existing, oldData, user)) {
+      throw Object.assign(new Error('Seul le rédacteur, le Directeur principal ou le Directeur adjoint peut modifier ce casier.'), { status: 403 });
+    }
+  }
+
+  const reviewer = canReviewCasiers(user);
+  const number = existing?.no || record.no || ((await p.query('SELECT COALESCE(MAX(no), 0) + 1 AS next_no FROM pm_casiers'))[0][0].next_no);
+  const createdByUsername = existing?.created_by_username || oldData.createdByUsername || existing?.saved_by || oldData.by || String(user.u || '');
+  const createdByRio = existing?.created_by_rio || oldData.createdByRio || ((createdByUsername === String(user.u || '')) ? String(user.rio || '') : '');
+  const savedBy = existing?.saved_by || oldData.by || String(user.u || '');
+  const status = reviewer ? 'APPROVED' : 'PENDING';
+  const reviewedBy = reviewer ? String(user.u || '') : null;
+  const reviewedAt = reviewer ? Date.now() : null;
+  const savedRecord = {
+    ...record,
+    id,
+    no: Number(number),
+    by: savedBy,
+    createdByUsername,
+    createdByRio,
+    createdByName: existing ? (oldData.createdByName || record.createdByName || record.agentNom || '') : (record.createdByName || user.nom || user.u),
+    status,
+    savedAt: new Date().toISOString(),
+    ...(reviewer ? { reviewedBy, reviewedAt } : { reviewedBy: '', reviewedAt: null, reviewNote: '' })
+  };
+  const suspectName = [savedRecord.prenom, savedRecord.nom].filter(Boolean).join(' ').trim() || 'Identité inconnue';
+  await p.query(
+    `INSERT INTO pm_casiers (id, no, suspect_name, location, data_json, saved_by, saved_at, created_by_rio, created_by_username, status, reviewed_by, reviewed_at, review_note)
+     VALUES (?, ?, ?, ?, ?, ?, NOW(), ?, ?, ?, ?, ?, ?)
+     ON DUPLICATE KEY UPDATE no = VALUES(no), suspect_name = VALUES(suspect_name), location = VALUES(location), data_json = VALUES(data_json), saved_by = VALUES(saved_by), saved_at = NOW(), created_by_rio = VALUES(created_by_rio), created_by_username = VALUES(created_by_username), status = VALUES(status), reviewed_by = VALUES(reviewed_by), reviewed_at = VALUES(reviewed_at), review_note = VALUES(review_note)`,
+    [id, savedRecord.no, suspectName, savedRecord.lieu || '', JSON.stringify(savedRecord), savedBy, createdByRio || null, createdByUsername || null, status, reviewedBy, reviewedAt, savedRecord.reviewNote || null]
+  );
+  const all = await getAllCasiers();
+  return { record: await getCasierByIdOrNo(id), records: all };
+}
+
+async function deleteCasier(id, user) {
+  const p = await getPool();
+  const [rows] = await p.query('SELECT * FROM pm_casiers WHERE id = ? LIMIT 1', [id]);
+  const row = rows[0];
+  if (!row) return false;
+  let data = {};
+  try { data = JSON.parse(row.data_json || '{}') || {}; } catch (_) {}
+  if (!canEditCasier(row, data, user)) throw Object.assign(new Error('Seul le rédacteur, le Directeur principal ou le Directeur adjoint peut supprimer ce casier.'), { status: 403 });
+  await p.query('DELETE FROM pm_casiers WHERE id = ?', [id]);
+  return true;
+}
+
+async function reviewCasier(id, { approved, note = '' }, user) {
+  if (!canReviewCasiers(user)) throw Object.assign(new Error('Validation réservée au Directeur principal et au Directeur adjoint.'), { status: 403 });
+  const p = await getPool();
+  const [rows] = await p.query('SELECT * FROM pm_casiers WHERE id = ? LIMIT 1', [id]);
+  const row = rows[0];
+  if (!row) return null;
+  let data = {};
+  try { data = JSON.parse(row.data_json || '{}') || {}; } catch (_) {}
+  data.status = approved ? 'APPROVED' : 'REJECTED';
+  data.reviewedBy = String(user.u || '');
+  data.reviewedAt = Date.now();
+  data.reviewNote = String(note || '').trim().slice(0, 500);
+  await p.query(
+    'UPDATE pm_casiers SET status = ?, reviewed_by = ?, reviewed_at = ?, review_note = ?, data_json = ? WHERE id = ?',
+    [data.status, data.reviewedBy, data.reviewedAt, data.reviewNote || null, JSON.stringify(data), id]
+  );
+  return await getCasierByIdOrNo(id);
+}
+
+async function importLegacyCasiers(records) {
+  const p = await getPool();
+  let inserted = 0;
+  for (const record of records) {
+    const id = String(record?.id || '').trim();
+    if (!/^[A-Za-z0-9_-]{1,64}$/.test(id) || !Array.isArray(record.lines)) continue;
+    const no = Math.max(0, Number(record.no) || 0);
+    const suspectName = [record.prenom, record.nom].filter(Boolean).join(' ').trim() || 'Identité inconnue';
+    const createdByUsername = String(record.by || 'archive');
+    const createdByRio = String(record.createdByRio || record.agentMat || '');
+    const imported = { ...record, no, status: 'APPROVED', createdByUsername, createdByRio };
+    const [result] = await p.query(
+      `INSERT IGNORE INTO pm_casiers (id, no, suspect_name, location, data_json, saved_by, saved_at, created_by_rio, created_by_username, status)
+       VALUES (?, ?, ?, ?, ?, ?, NOW(), ?, ?, 'APPROVED')`,
+      [id, no, suspectName, imported.lieu || '', JSON.stringify(imported), createdByUsername, createdByRio || null, createdByUsername]
+    );
+    inserted += result.affectedRows;
+  }
+  return inserted;
 }
 
 async function getCasierByIdOrNo(idOrNo) {
@@ -794,6 +924,10 @@ module.exports = {
   markServiceReportNotified,
   getAllCasiers,
   getCasierByIdOrNo,
+  saveCasier,
+  deleteCasier,
+  reviewCasier,
+  importLegacyCasiers,
   createAbsence,
   getAbsenceById,
   updateAbsenceMessage,
