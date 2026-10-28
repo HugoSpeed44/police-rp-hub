@@ -283,6 +283,17 @@ async function getOfficerByDiscordId(discordId) {
   return rows[0] || null;
 }
 
+async function setOfficerDiscordId(rio, discordId) {
+  const p = await getPool();
+  if (discordId) {
+    const [taken] = await p.query('SELECT rio FROM pm_officers WHERE discord_id = ? AND rio <> ? LIMIT 1', [discordId, rio]);
+    if (taken.length) return { ok: false, reason: 'already_linked' };
+  }
+  const [result] = await p.query('UPDATE pm_officers SET discord_id = ? WHERE rio = ?', [discordId || null, rio]);
+  if (!result.affectedRows) return { ok: false, reason: 'account_not_found' };
+  return { ok: true, officer: await getOfficerByRio(rio) };
+}
+
 async function getOfficerByRio(rio) {
   const p = await getPool();
   const [rows] = await p.query('SELECT * FROM pm_officers WHERE rio = ?', [rio]);
@@ -757,6 +768,7 @@ module.exports = {
   setConfig,
   getOfficerByUsername,
   getOfficerByDiscordId,
+  setOfficerDiscordId,
   getOfficerByRio,
   getAllOfficers,
   saveOfficer,

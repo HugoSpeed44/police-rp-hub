@@ -120,6 +120,19 @@ const server = http.createServer(async (req, res) => {
     }
     if (!user) return send(res, 401, { ok: false, error: 'Session expirée, reconnectez-vous.' });
 
+    if (path === '/api/auth/discord-link' && req.method === 'POST') {
+      const body = await readJson(req);
+      const discordId = String(body.discord_id || '').trim();
+      if (discordId && !/^\d{17,20}$/.test(discordId)) return send(res, 400, { ok: false, error: 'ID Discord invalide : saisis l’ID numérique (17 à 20 chiffres).' });
+      const result = await db.setOfficerDiscordId(user.rio, discordId);
+      if (!result.ok && result.reason === 'already_linked') return send(res, 409, { ok: false, error: 'Cet ID Discord est déjà associé à un autre compte.' });
+      if (!result.ok) return send(res, 404, { ok: false, error: 'Compte agent introuvable.' });
+      const updatedUser = normalizeOfficer(result.officer);
+      const token = /^Bearer\s+(.+)$/i.exec(req.headers.authorization || '')?.[1];
+      if (token && sessions.has(token)) sessions.get(token).user = updatedUser;
+      return send(res, 200, { ok: true, user: updatedUser });
+    }
+
     if (path === '/api/service/status' && req.method === 'GET') {
       const rio = String(url.searchParams.get('rio') || user.rio);
       const [activeServices, csuState, patrols, reports, currentService] = await Promise.all([
