@@ -123,6 +123,11 @@ async function initDatabase() {
       INDEX idx_report_rio (officer_rio)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
   `);
+  for (const migration of [
+    'ALTER TABLE pm_service_reports ADD COLUMN discord_id VARCHAR(32) NULL',
+    'ALTER TABLE pm_service_reports ADD COLUMN notification_sent TINYINT(1) NOT NULL DEFAULT 0'
+  ]) { try { await p.query(migration); } catch (err) { if (err.code !== 'ER_DUP_FIELDNAME') throw err; } }
+  await p.query("UPDATE pm_service_reports SET notification_sent = 1 WHERE notification_sent = 0 AND created_at < NOW() - INTERVAL 10 MINUTE");
 
   // Ensure cumulative hours columns in pm_officers
   try {
@@ -415,11 +420,8 @@ async function setOfficerPatrol(rio, patrolName) {
 
 async function startService({ rio, discord_id, nom, grade, is_csu = 0, patrol_name = null }) {
   const p = await getPool();
-  // End any stale active service first
-  await p.query(
-    "UPDATE pm_services SET status = 'TERMINE', end_time = ? WHERE officer_rio = ? AND status IN ('EN_SERVICE', 'EN_PAUSE')",
-    [Date.now(), rio]
-  );
+  const active = await getActiveServiceByRio(rio);
+  if (active) return { alreadyActive: true, ...active };
 
   const now = Date.now();
   const cleanPatrol = patrol_name && patrol_name.trim() !== '' ? patrol_name.trim() : null;
@@ -462,7 +464,7 @@ async function togglePauseService(rio) {
   return null;
 }
 
-async function stopService(rio) {
+async function stopService(rio, { report = '', discord_id = null } = {}) {
   const p = await getPool();
   const active = await getActiveServiceByRio(rio);
   if (!active) return null;
@@ -497,13 +499,14 @@ async function stopService(rio) {
   const endTimeStr = endDate.toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit' });
   const typeStr = active.is_csu ? 'Supervision Vidéoprotection (CSU)' : (active.patrol_name || 'Patrouille Opérationnelle');
   const pauseMin = Math.floor(totalPause / 60000);
-  const reportStr = `Vacation officielle achevée (${hoursWorked}h validées). Pause déduite : ${pauseMin} min.`;
+  const activity = String(report || '').trim().slice(0, 1500);
+  const reportStr = `${activity || 'Aucune activité précisée.'}\n\nVacation officielle achevée (${hoursWorked}h validées). Pause déduite : ${pauseMin} min.`;
 
   try {
     await p.query(
-      `INSERT INTO pm_service_reports (officer_rio, officer_name, date, start_time, end_time, duration_hours, type, report)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-      [rio, active.nom, dateStr, startTimeStr, endTimeStr, hoursWorked, typeStr, reportStr]
+      `INSERT INTO pm_service_reports (officer_rio, discord_id, officer_name, date, start_time, end_time, duration_hours, type, report)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [rio, discord_id || active.discord_id || null, active.nom, dateStr, startTimeStr, endTimeStr, hoursWorked, typeStr, reportStr]
     );
   } catch (err) {
     console.warn('Erreur log service report:', err.message);
@@ -548,6 +551,17 @@ async function getRecentServiceReports(limit = 25) {
   } catch (_) {
     return [];
   }
+}
+
+async function getPendingServiceReports(limit = 20) {
+  const p = await getPool();
+  const [rows] = await p.query('SELECT * FROM pm_service_reports WHERE notification_sent = 0 ORDER BY id ASC LIMIT ?', [limit]);
+  return rows;
+}
+
+async function markServiceReportNotified(id) {
+  const p = await getPool();
+  await p.query('UPDATE pm_service_reports SET notification_sent = 1 WHERE id = ?', [id]);
 }
 
 // CSU state helpers
@@ -765,6 +779,8 @@ module.exports = {
   setOfficerPatrol,
   ensureOfficerRio,
   getRecentServiceReports,
+  getPendingServiceReports,
+  markServiceReportNotified,
   getAllCasiers,
   getCasierByIdOrNo,
   createAbsence,

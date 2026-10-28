@@ -92,7 +92,7 @@ const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
   const path = url.pathname;
   try {
-    if (path === '/health') return send(res, 200, { ok: true, service: 'police-rp-api' });
+    if (path === '/' || path === '/health') return send(res, 200, { ok: true, service: 'police-rp-api' });
 
     if (path === '/api/auth/login' && req.method === 'POST') {
       const body = await readJson(req);
@@ -131,14 +131,18 @@ const server = http.createServer(async (req, res) => {
 
     if (path === '/api/service/start' && req.method === 'POST') {
       const body = await readJson(req);
+      const active = await db.getActiveServiceByRio(user.rio);
+      if (active) return send(res, 409, { ok: false, error: 'Vous êtes déjà en service. Reprenez votre service ou terminez-le avant d’en commencer un autre.' });
       const service = await db.startService({ rio: user.rio, discord_id: user.discord_id, nom: user.nom, grade: user.grade, is_csu: body.is_csu ? 1 : 0 });
+      if (service?.alreadyActive) return send(res, 409, { ok: false, error: 'Vous êtes déjà en service. Reprenez votre service ou terminez-le avant d’en commencer un autre.' });
       return send(res, 200, { ok: true, service: await db.getActiveServiceByRio(user.rio) || service });
     }
     if (path === '/api/service/pause' && req.method === 'POST') {
       return send(res, 200, { ok: true, service: await db.togglePauseService(user.rio) });
     }
     if (path === '/api/service/stop' && req.method === 'POST') {
-      return send(res, 200, { ok: true, service: await db.stopService(user.rio) });
+      const body = await readJson(req);
+      return send(res, 200, { ok: true, service: await db.stopService(user.rio, { report: body.report, discord_id: user.discord_id }) });
     }
     if (path === '/api/service/csu' && req.method === 'POST') {
       const body = await readJson(req);
