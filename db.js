@@ -148,6 +148,9 @@ async function initDatabase() {
     );
   }
 
+  // Préserver l'accès des comptes administrateurs déjà en place après l'ajout du contrôle website_access.
+  await p.query("UPDATE pm_officers SET website_access = 1 WHERE is_admin = 1 OR LOWER(username) = 'admin'");
+
   // Seed default CSU row if not exists
   const [csuRows] = await p.query('SELECT COUNT(*) as cnt FROM pm_csu WHERE id = 1');
   if (csuRows[0].cnt === 0) {
