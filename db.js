@@ -94,6 +94,25 @@ async function initDatabase() {
   `);
 
   await p.query(`
+    CREATE TABLE IF NOT EXISTS pm_calendar_events (
+      id VARCHAR(80) PRIMARY KEY,
+      title VARCHAR(180) NOT NULL,
+      event_date VARCHAR(10) NOT NULL,
+      start_time VARCHAR(8) NOT NULL DEFAULT '08:30',
+      end_time VARCHAR(8) NOT NULL DEFAULT '12:00',
+      priority VARCHAR(64) NOT NULL DEFAULT 'Important',
+      location VARCHAR(255) NOT NULL DEFAULT '',
+      description TEXT NULL,
+      author VARCHAR(160) NOT NULL DEFAULT 'Police Municipale',
+      is_deleted TINYINT(1) NOT NULL DEFAULT 0,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+      INDEX idx_calendar_date (event_date),
+      INDEX idx_calendar_deleted (is_deleted)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+  `);
+
+  await p.query(`
     CREATE TABLE IF NOT EXISTS pm_site_account_issuance (
       discord_id VARCHAR(32) PRIMARY KEY,
       username VARCHAR(64) NOT NULL,
@@ -415,6 +434,65 @@ async function getManagementHistory(limit = 30) {
   const safeLimit = Math.max(1, Math.min(100, Number(limit) || 30));
   const [rows] = await p.query('SELECT id, officer_rio AS officerBadge, officer_name AS officerName, action, details, author, created_at AS date FROM pm_management_history ORDER BY id DESC LIMIT ?', [safeLimit]);
   return rows.map(row => ({ ...row, date: row.date instanceof Date ? row.date.toISOString().slice(0, 16).replace('T', ' ') : row.date }));
+}
+
+function normalizeCalendarEvent(event) {
+  return {
+    id: String(event.id || '').trim().slice(0, 80),
+    title: String(event.title || '').trim().slice(0, 180),
+    date: String(event.date || '').trim(),
+    startTime: String(event.startTime || '08:30').trim().slice(0, 8),
+    endTime: String(event.endTime || '12:00').trim().slice(0, 8),
+    priority: String(event.priority || event.category || 'Important').trim().slice(0, 64),
+    location: String(event.location || '').trim().slice(0, 255),
+    description: String(event.description || '').trim().slice(0, 12000),
+    author: String(event.author || 'Police Municipale').trim().slice(0, 160)
+  };
+}
+
+async function getCalendarEvents() {
+  const p = await getPool();
+  const [rows] = await p.query(
+    'SELECT id, title, event_date AS date, start_time AS startTime, end_time AS endTime, priority, location, description, author FROM pm_calendar_events WHERE is_deleted = 0 ORDER BY event_date ASC, start_time ASC, created_at ASC'
+  );
+  return rows;
+}
+
+async function upsertCalendarEvent(event) {
+  const p = await getPool();
+  const item = normalizeCalendarEvent(event);
+  await p.query(
+    `INSERT INTO pm_calendar_events (id, title, event_date, start_time, end_time, priority, location, description, author, is_deleted)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
+     ON DUPLICATE KEY UPDATE title = VALUES(title), event_date = VALUES(event_date), start_time = VALUES(start_time), end_time = VALUES(end_time), priority = VALUES(priority), location = VALUES(location), description = VALUES(description), author = VALUES(author), is_deleted = 0`,
+    [item.id, item.title, item.date, item.startTime, item.endTime, item.priority, item.location, item.description, item.author]
+  );
+  const [rows] = await p.query(
+    'SELECT id, title, event_date AS date, start_time AS startTime, end_time AS endTime, priority, location, description, author FROM pm_calendar_events WHERE id = ? AND is_deleted = 0',
+    [item.id]
+  );
+  return rows[0] || null;
+}
+
+async function importLegacyCalendarEvents(events) {
+  const p = await getPool();
+  let imported = 0;
+  for (const raw of events) {
+    const item = normalizeCalendarEvent(raw || {});
+    if (!item.id || !item.title || !/^\d{4}-\d{2}-\d{2}$/.test(item.date)) continue;
+    const [result] = await p.query(
+      'INSERT IGNORE INTO pm_calendar_events (id, title, event_date, start_time, end_time, priority, location, description, author, is_deleted) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0)',
+      [item.id, item.title, item.date, item.startTime, item.endTime, item.priority, item.location, item.description, item.author]
+    );
+    imported += Number(result.affectedRows || 0);
+  }
+  return imported;
+}
+
+async function deleteCalendarEvent(id) {
+  const p = await getPool();
+  const [result] = await p.query('UPDATE pm_calendar_events SET is_deleted = 1 WHERE id = ? AND is_deleted = 0', [id]);
+  return Number(result.affectedRows || 0) > 0;
 }
 
 async function deleteOfficerAccount(rio) {
@@ -1021,6 +1099,10 @@ module.exports = {
   getPortalAccounts,
   updateOfficerHr,
   getManagementHistory,
+  getCalendarEvents,
+  upsertCalendarEvent,
+  importLegacyCalendarEvents,
+  deleteCalendarEvent,
   deleteOfficerAccount,
   completeOfficerProfile,
   saveOfficer,

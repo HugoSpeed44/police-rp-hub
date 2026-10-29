@@ -173,6 +173,41 @@ const server = http.createServer(async (req, res) => {
       return send(res, 200, { ok: true, history: await db.getManagementHistory(30) });
     }
 
+    if (path === '/api/calendar/events' && req.method === 'GET') {
+      return send(res, 200, { ok: true, events: await db.getCalendarEvents() });
+    }
+    if (path === '/api/calendar/events/import-legacy' && req.method === 'POST') {
+      const body = await readJson(req, 2 * 1024 * 1024);
+      if (!Array.isArray(body.events) || body.events.length > 2000) {
+        return send(res, 400, { ok: false, error: 'Liste d’événements invalide.' });
+      }
+      const imported = await db.importLegacyCalendarEvents(body.events);
+      return send(res, 200, { ok: true, imported, events: await db.getCalendarEvents() });
+    }
+    if (path === '/api/calendar/events' && req.method === 'PUT') {
+      const body = await readJson(req);
+      const id = String(body.id || '').trim();
+      const title = String(body.title || '').trim();
+      const date = String(body.date || '').trim();
+      if (!id || id.length > 80 || !title || title.length > 180 || !/^\d{4}-\d{2}-\d{2}$/.test(date)) {
+        return send(res, 400, { ok: false, error: 'Titre, date ou identifiant invalide.' });
+      }
+      const event = await db.upsertCalendarEvent({
+        ...body,
+        id,
+        title,
+        date,
+        author: body.author || `${user.nom || user.u} (#${user.rio || user.mat || '—'})`
+      });
+      return send(res, 200, { ok: true, event });
+    }
+    const calendarEventMatch = /^\/api\/calendar\/events\/([A-Za-z0-9_-]{1,80})$/.exec(path);
+    if (calendarEventMatch && req.method === 'DELETE') {
+      const deleted = await db.deleteCalendarEvent(calendarEventMatch[1]);
+      if (!deleted) return send(res, 404, { ok: false, error: 'Événement introuvable.' });
+      return send(res, 200, { ok: true });
+    }
+
     if (path === '/api/officers' && req.method === 'GET') {
       const officers = await db.getPublicOfficers();
       return send(res, 200, { ok: true, officers: officers.map(officer => {
