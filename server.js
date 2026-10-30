@@ -215,6 +215,7 @@ const server = http.createServer(async (req, res) => {
         return {
           badge: String(officer.rio), firstName: nameParts.shift() || '', lastName: nameParts.join(' '),
           grade: officer.grade || 'Agent PM', specialties: officer.specialties || [],
+          status: officer.service_status === 'EN_SERVICE' ? 'En service' : officer.service_status === 'EN_PAUSE' ? 'En pause' : 'Hors service',
           salary: Number(officer.salary || 0), notes: officer.notes || '', awards: officer.awards || [], warnings: officer.warnings || [],
           weekHours: Number(officer.week_hours || 0), totalHours: Number(officer.total_hours || 0)
         };

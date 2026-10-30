@@ -388,7 +388,9 @@ async function getAllOfficers() {
 async function getPublicOfficers() {
   const p = await getPool();
   const [rows] = await p.query(
-    'SELECT id, discord_id, username, rio, nom, grade, specialties, salary, notes, awards, warnings, is_admin, created_at, week_hours, total_hours FROM pm_officers WHERE profile_completed = 1 ORDER BY nom ASC'
+    `SELECT o.id, o.discord_id, o.username, o.rio, o.nom, o.grade, o.specialties, o.salary, o.notes, o.awards, o.warnings, o.is_admin, o.created_at, o.week_hours, o.total_hours,
+      COALESCE((SELECT s.status FROM pm_services s WHERE s.officer_rio = o.rio AND s.status IN ('EN_SERVICE', 'EN_PAUSE') ORDER BY s.id DESC LIMIT 1), 'HORS_SERVICE') AS service_status
+     FROM pm_officers o WHERE o.profile_completed = 1 ORDER BY o.nom ASC`
   );
   return rows.map(r => ({
     ...r,
